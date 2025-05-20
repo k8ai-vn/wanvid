@@ -1,0 +1,62 @@
+__pycache__
+.ipynb_checkpoints
+*.pth
+UCF-101/
+results/
+wandb/
+*.ipynb
+*.jpg
+*.safetensors
+*.mp4
+*.png
+*.gif
+*.pth
+*.pt
+cache_dir/
+wandb/
+runs/
+samples/
+*validation/
+data/
+outputs/
+outputs_video
+sbatch.sh
+*.out
+env
+*.o
+**/build/
+**.pyc
+**.txt
+**.json
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+eggs/
+.eggs/
+
+# Sphinx documentation
+docs/_build/
+docs/source/getting_started/examples/
+docs/source/inference/examples/
+
+# VSCode
+.vscode/
+
+# DS Store
+.DS_Store
+
+# vim swap files
+*.swo
+*.swp
+
+# Python pickle files
+*.pkl
+
+# Reference videos
+!fastvideo/v1/tests/ssim/reference_videos/**/*.mp4
+
+# Static images
+!docs/source/_static/images/**/*.png
