@@ -2,14 +2,15 @@ import os
 import time
 
 from fastvideo import VideoGenerator, SamplingParam
-
+# MODEL_NAME = '"Wan-AI/Wan2.1-T2V-1.3B-Diffusers",'
+MODEL_NAME = 'Wan-AI/Wan2.1-T2V-14B'
 def main():
     # set the attention backend 
     os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "FLASH_ATTN"
 
     start_time = time.perf_counter()
     gen = VideoGenerator.from_pretrained(
-        model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        model_path=MODEL_NAME,
         num_gpus=1,
         use_cpu_offload=False,
     )
@@ -19,7 +20,7 @@ def main():
     gen_start_time = time.perf_counter()
 
     params = SamplingParam.from_pretrained(
-        model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        model_path=MODEL_NAME,
     )
     # this controls the threshold for the tea cache
     params.teacache_params.teacache_thresh = 0.08
