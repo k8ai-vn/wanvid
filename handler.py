@@ -30,7 +30,7 @@ def main():
         height=480,
         width=832,
         num_frames=61,  # 85 ,77 
-        num_inference_steps=50,
+        num_inference_steps=6,
         enable_teacache=True,
         seed=1024,
         output_path="example_outputs/")
