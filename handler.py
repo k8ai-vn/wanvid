@@ -2,6 +2,8 @@ import argparse
 import os
 import time
 import torch
+import torch.distributed as dist
+
 from diffusers import BitsAndBytesConfig
 from diffusers.utils import export_to_video
 
