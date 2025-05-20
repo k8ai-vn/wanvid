@@ -1,120 +1,363 @@
 import os
 import time
-import argparse
-import torch
 
 from fastvideo import VideoGenerator, SamplingParam
+from diffusers import BitsAndBytesConfig
+from fastvideo.models.hunyuan_hf.modeling_hunyuan import HunyuanVideoTransformer3DModel
+from fastvideo.models.hunyuan_hf.pipeline_hunyuan import HunyuanVideoPipeline
+from fastvideo.utils.parallel_states import initialize_sequence_parallel_state, nccl_info
 
-def main(args):
-    # Set the attention backend
-    os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "FLASH_ATTN"
+
+MODEL_NAME = '"Wan-AI/Wan2.1-T2V-1.3B-Diffusers",'
+# MODEL_NAME = 'Wan-AI/Wan2.1-T2V-14B'
+# def main():
+#     # set the attention backend 
+#     os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "FLASH_ATTN"
+
+#     start_time = time.perf_counter()
+#     gen = VideoGenerator.from_pretrained(
+#         model_path=MODEL_NAME,
+#         num_gpus=1,
+#         use_cpu_offload=False,
+#     )
+#     load_time = time.perf_counter() - start_time
+#     print(f"Model loading time: {load_time:.2f} seconds")
+
+#     gen_start_time = time.perf_counter()
+
+#     params = SamplingParam.from_pretrained(
+#         model_path=MODEL_NAME,
+#     )
+#     # this controls the threshold for the tea cache
+#     params.teacache_params.teacache_thresh = 0.08
+#     gen.generate_video(
+#         prompt=
+#         "The girl is playing with her mobile phone. There are fireworks effects around her. The girl smiles happily.",
+#         sampling_param=params,
+#         height=480,
+#         width=832,
+#         num_frames=61,  # 85 ,77 
+#         num_inference_steps=6,
+#         enable_teacache=True,
+#         seed=1024,
+#         output_path="example_outputs/")
     
-    # Print GPU info
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        print(f"Using GPU: {torch.cuda.get_device_name(device)}")
-        print(f"Available VRAM: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.2f} GiB")
-        torch.cuda.reset_max_memory_allocated(device)
-    
-    print(f"Loading model: {args.model_path}")
-    start_time = time.perf_counter()
-    
-    # Initialize generator with quantization if specified
-    gen = VideoGenerator.from_pretrained(
-        model_path=args.model_path,
-        num_gpus=args.num_gpus,
-        use_cpu_offload=args.cpu_offload,
-        quantization=args.quantization
-    )
-    
-    load_time = time.perf_counter() - start_time
-    print(f"Model loading time: {load_time:.2f} seconds")
-    
-    if torch.cuda.is_available():
-        print(f"VRAM used for model loading: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GiB")
-        torch.cuda.reset_max_memory_allocated(device)
-    
-    # Prepare output directory
-    os.makedirs(args.output_path, exist_ok=True)
-    
-    # Process either a single prompt or multiple prompts from a file
-    prompts = []
-    if args.prompt_file:
-        with open(args.prompt_file, 'r') as f:
-            prompts = [line.strip() for line in f.readlines() if line.strip()]
+#     generation_time = time.perf_counter() - gen_start_time
+#     print(f"Video generation time: {generation_time:.2f} seconds")
+
+#     total_time = time.perf_counter() - start_time
+#     print(f"Total execution time: {total_time:.2f} seconds")
+
+# if __name__ == "__main__":
+#     main()
+import argparse
+import json
+import os
+import time
+
+import torch
+import torch.distributed as dist
+from diffusers import BitsAndBytesConfig
+from diffusers.utils import export_to_video
+
+from fastvideo.models.hunyuan_hf.modeling_hunyuan import HunyuanVideoTransformer3DModel
+from fastvideo.models.hunyuan_hf.pipeline_hunyuan import HunyuanVideoPipeline
+from fastvideo.utils.parallel_states import initialize_sequence_parallel_state, nccl_info
+
+
+def initialize_distributed():
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    local_rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    print("world_size", world_size)
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=local_rank)
+    initialize_sequence_parallel_state(world_size)
+
+
+def inference(args):
+    initialize_distributed()
+    print(nccl_info.sp_size)
+    device = torch.cuda.current_device()
+    # Peiyuan: GPU seed will cause A100 and H100 to produce different results .....
+    weight_dtype = torch.bfloat16
+
+    if args.transformer_path is not None:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(args.transformer_path)
+    else:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(args.model_path,
+                                                                     subfolder="transformer/",
+                                                                     torch_dtype=weight_dtype)
+
+    pipe = HunyuanVideoPipeline.from_pretrained(args.model_path, transformer=transformer, torch_dtype=weight_dtype)
+
+    pipe.enable_vae_tiling()
+
+    if args.lora_checkpoint_dir is not None:
+        print(f"Loading LoRA weights from {args.lora_checkpoint_dir}")
+        config_path = os.path.join(args.lora_checkpoint_dir, "lora_config.json")
+        with open(config_path, "r") as f:
+            lora_config_dict = json.load(f)
+        rank = lora_config_dict["lora_params"]["lora_rank"]
+        lora_alpha = lora_config_dict["lora_params"]["lora_alpha"]
+        lora_scaling = lora_alpha / rank
+        pipe.load_lora_weights(args.lora_checkpoint_dir, adapter_name="default")
+        pipe.set_adapters(["default"], [lora_scaling])
+        print(f"Successfully Loaded LoRA weights from {args.lora_checkpoint_dir}")
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload(device)
+    else:
+        pipe.to(device)
+
+    # Generate videos from the input prompt
+
+    if args.prompt_embed_path is not None:
+        prompt_embeds = (torch.load(args.prompt_embed_path, map_location="cpu",
+                                    weights_only=True).to(device).unsqueeze(0))
+        encoder_attention_mask = (torch.load(args.encoder_attention_mask_path, map_location="cpu",
+                                             weights_only=True).to(device).unsqueeze(0))
+        prompts = None
+    elif args.prompt_path is not None:
+        prompts = [line.strip() for line in open(args.prompt_path, "r")]
+        prompt_embeds = None
+        encoder_attention_mask = None
+    else:
+        prompts = args.prompts
+        prompt_embeds = None
+        encoder_attention_mask = None
+
+    if prompts is not None:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for prompt in prompts:
+                generator = torch.Generator("cpu").manual_seed(args.seed)
+                video = pipe(
+                    prompt=[prompt],
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    num_inference_steps=args.num_inference_steps,
+                    generator=generator,
+                ).frames
+                if nccl_info.global_rank <= 0:
+                    os.makedirs(args.output_path, exist_ok=True)
+                    suffix = prompt.split(".")[0]
+                    export_to_video(
+                        video[0],
+                        os.path.join(args.output_path, f"{suffix}.mp4"),
+                        fps=24,
+                    )
+    else:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            generator = torch.Generator("cpu").manual_seed(args.seed)
+            videos = pipe(
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=encoder_attention_mask,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                num_inference_steps=args.num_inference_steps,
+                generator=generator,
+            ).frames
+
+        if nccl_info.global_rank <= 0:
+            export_to_video(videos[0], args.output_path + ".mp4", fps=24)
+
+
+def inference_quantization(args):
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = args.model_path
+
+    if args.quantization == "nf4":
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True,
+                                                 bnb_4bit_compute_dtype=torch.bfloat16,
+                                                 bnb_4bit_quant_type="nf4",
+                                                 llm_int8_skip_modules=["proj_out", "norm_out"])
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(model_id,
+                                                                     subfolder="transformer/",
+                                                                     torch_dtype=torch.bfloat16,
+                                                                     quantization_config=quantization_config)
+    if args.quantization == "int8":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=["proj_out", "norm_out"])
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(model_id,
+                                                                     subfolder="transformer/",
+                                                                     torch_dtype=torch.bfloat16,
+                                                                     quantization_config=quantization_config)
+    elif not args.quantization:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(model_id,
+                                                                     subfolder="transformer/",
+                                                                     torch_dtype=torch.bfloat16).to(device)
+
+    print("Max vram for read transformer:", round(torch.cuda.max_memory_allocated(device="cuda") / 1024**3, 3), "GiB")
+    torch.cuda.reset_max_memory_allocated(device)
+
+    if not args.cpu_offload:
+        pipe = HunyuanVideoPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device)
+        pipe.transformer = transformer
+    else:
+        pipe = HunyuanVideoPipeline.from_pretrained(model_id, transformer=transformer, torch_dtype=torch.bfloat16)
+    torch.cuda.reset_max_memory_allocated(device)
+    pipe.scheduler._shift = args.flow_shift
+    pipe.vae.enable_tiling()
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload()
+    print("Max vram for init pipeline:", round(torch.cuda.max_memory_allocated(device="cuda") / 1024**3, 3), "GiB")
+    if args.prompt.endswith('.txt'):
+        with open(args.prompt) as f:
+            prompts = [line.strip() for line in f.readlines()]
     else:
         prompts = [args.prompt]
-    
-    for i, prompt in enumerate(prompts):
-        gen_start_time = time.perf_counter()
-        
-        # Configure sampling parameters
-        params = SamplingParam.from_pretrained(
-            model_path=args.model_path,
-        )
-        
-        # Set TEACache parameters if enabled
-        if args.enable_teacache:
-            params.teacache_params.teacache_thresh = args.teacache_thresh
-        
-        # Generate video
-        output_file = f"{args.output_path}/video_{i+1:03d}.mp4"
-        print(f"Generating video {i+1}/{len(prompts)}")
-        print(f"Prompt: {prompt}")
-        
-        gen.generate_video(
+
+    generator = torch.Generator("cpu").manual_seed(args.seed)
+    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    torch.cuda.reset_max_memory_allocated(device)
+    for prompt in prompts:
+        start_time = time.perf_counter()
+        output = pipe(
             prompt=prompt,
-            sampling_param=params,
             height=args.height,
             width=args.width,
             num_frames=args.num_frames,
             num_inference_steps=args.num_inference_steps,
-            enable_teacache=args.enable_teacache,
-            seed=args.seed,
-            output_path=output_file
-        )
-        
-        generation_time = time.perf_counter() - gen_start_time
-        print(f"Video {i+1} generation time: {generation_time:.2f} seconds")
-        
-        if torch.cuda.is_available():
-            print(f"Peak VRAM usage: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GiB")
-            torch.cuda.reset_max_memory_allocated(device)
-    
-    total_time = time.perf_counter() - start_time
-    print(f"Total execution time: {total_time:.2f} seconds")
+            generator=generator,
+        ).frames[0]
+        export_to_video(output, os.path.join(args.output_path, f"{prompt[:100]}.mp4"), fps=args.fps)
+        print("Time:", round(time.perf_counter() - start_time, 2), "seconds")
+        print("Max vram for denoise:", round(torch.cuda.max_memory_allocated(device="cuda") / 1024**3, 3), "GiB")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FastVideo Generator")
-    parser.add_argument("--model_path", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-                        help="Path or name of the pretrained model")
-    parser.add_argument("--prompt", type=str, 
-                        default="The girl is playing with her mobile phone. There are fireworks effects around her. The girl smiles happily.",
-                        help="Text prompt for video generation")
-    parser.add_argument("--prompt_file", type=str, default=None,
-                        help="Path to a file containing prompts (one per line)")
-    parser.add_argument("--output_path", type=str, default="example_outputs",
-                        help="Directory to save generated videos")
-    parser.add_argument("--height", type=int, default=480,
-                        help="Height of generated video")
-    parser.add_argument("--width", type=int, default=832,
-                        help="Width of generated video")
-    parser.add_argument("--num_frames", type=int, default=61,
-                        help="Number of frames to generate")
-    parser.add_argument("--num_inference_steps", type=int, default=6,
-                        help="Number of denoising steps")
-    parser.add_argument("--seed", type=int, default=1024,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--num_gpus", type=int, default=1,
-                        help="Number of GPUs to use")
-    parser.add_argument("--cpu_offload", action="store_true",
-                        help="Enable CPU offloading for memory efficiency")
-    parser.add_argument("--enable_teacache", action="store_true", default=True,
-                        help="Enable TEACache for faster generation")
-    parser.add_argument("--teacache_thresh", type=float, default=0.08,
-                        help="TEACache threshold value")
-    parser.add_argument("--quantization", type=str, default=None, choices=[None, "nf4", "int8"],
-                        help="Quantization method for reduced memory usage")
-    
+    parser = argparse.ArgumentParser()
+
+    # Basic parameters
+    parser.add_argument("--prompt", type=str, help="prompt file for inference")
+    parser.add_argument("--prompt_embed_path", type=str, default=None)
+    parser.add_argument("--prompt_path", type=str, default=None)
+    parser.add_argument("--num_frames", type=int, default=16)
+    parser.add_argument("--height", type=int, default=256)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--model_path", type=str, default="data/hunyuan")
+    parser.add_argument("--transformer_path", type=str, default=None)
+    parser.add_argument("--output_path", type=str, default="./outputs/video")
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--quantization", type=str, default=None)
+    parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument(
+        "--lora_checkpoint_dir",
+        type=str,
+        default=None,
+        help="Path to the directory containing LoRA checkpoints",
+    )
+    # Additional parameters
+    parser.add_argument(
+        "--denoise-type",
+        type=str,
+        default="flow",
+        help="Denoise type for noised inputs.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
+    parser.add_argument("--neg_prompt", type=str, default=None, help="Negative prompt for sampling.")
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help="Classifier free guidance scale.",
+    )
+    parser.add_argument(
+        "--embedded_cfg_scale",
+        type=float,
+        default=6.0,
+        help="Embedded classifier free guidance scale.",
+    )
+    parser.add_argument("--flow_shift", type=int, default=7, help="Flow shift parameter.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference.")
+    parser.add_argument(
+        "--num_videos",
+        type=int,
+        default=1,
+        help="Number of videos to generate per prompt.",
+    )
+    parser.add_argument(
+        "--load-key",
+        type=str,
+        default="module",
+        help="Key to load the model states. 'module' for the main model, 'ema' for the EMA model.",
+    )
+    parser.add_argument(
+        "--dit-weight",
+        type=str,
+        default="data/hunyuan/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
+    )
+    parser.add_argument(
+        "--reproduce",
+        action="store_true",
+        help="Enable reproducibility by setting random seeds and deterministic algorithms.",
+    )
+    parser.add_argument(
+        "--disable-autocast",
+        action="store_true",
+        help="Disable autocast for denoising loop and vae decoding in pipeline sampling.",
+    )
+
+    # Flow Matching
+    parser.add_argument(
+        "--flow-reverse",
+        action="store_true",
+        help="If reverse, learning/sampling from t=1 -> t=0.",
+    )
+    parser.add_argument("--flow-solver", type=str, default="euler", help="Solver for flow matching.")
+    parser.add_argument(
+        "--use-linear-quadratic-schedule",
+        action="store_true",
+        help=
+        "Use linear quadratic schedule for flow matching. Following MovieGen (https://ai.meta.com/static-resource/movie-gen-research-paper)",
+    )
+    parser.add_argument(
+        "--linear-schedule-end",
+        type=int,
+        default=25,
+        help="End step for linear quadratic schedule for flow matching.",
+    )
+
+    # Model parameters
+    parser.add_argument("--model", type=str, default="HYVideo-T/2-cfgdistill")
+    parser.add_argument("--latent-channels", type=int, default=16)
+    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16", "fp8"])
+    parser.add_argument("--rope-theta", type=int, default=256, help="Theta used in RoPE.")
+
+    parser.add_argument("--vae", type=str, default="884-16c-hy")
+    parser.add_argument("--vae-precision", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--vae-tiling", action="store_true", default=True)
+
+    parser.add_argument("--text-encoder", type=str, default="llm")
+    parser.add_argument(
+        "--text-encoder-precision",
+        type=str,
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+    )
+    parser.add_argument("--text-states-dim", type=int, default=4096)
+    parser.add_argument("--text-len", type=int, default=256)
+    parser.add_argument("--tokenizer", type=str, default="llm")
+    parser.add_argument("--prompt-template", type=str, default="dit-llm-encode")
+    parser.add_argument("--prompt-template-video", type=str, default="dit-llm-encode-video")
+    parser.add_argument("--hidden-state-skip-layer", type=int, default=2)
+    parser.add_argument("--apply-final-norm", action="store_true")
+
+    parser.add_argument("--text-encoder-2", type=str, default="clipL")
+    parser.add_argument(
+        "--text-encoder-precision-2",
+        type=str,
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+    )
+    parser.add_argument("--text-states-dim-2", type=int, default=768)
+    parser.add_argument("--tokenizer-2", type=str, default="clipL")
+    parser.add_argument("--text-len-2", type=int, default=77)
+
     args = parser.parse_args()
-    main(args)
+    if args.quantization:
+        inference_quantization(args)
+    else:
+        inference(args)
