@@ -25,7 +25,7 @@ def main():
     params.teacache_params.teacache_thresh = 0.08
     gen.generate_video(
         prompt=
-        "Will Smith casually eats noodles, his relaxed demeanor contrasting with the energetic background of a bustling street food market. The scene captures a mix of humor and authenticity. Mid-shot framing, vibrant lighting.",
+        "The girl is playing with her mobile phone. There are fireworks effects around her. The girl smiles happily.",
         sampling_param=params,
         height=480,
         width=832,
