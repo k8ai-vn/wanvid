@@ -2,8 +2,8 @@ import os
 import time
 
 from fastvideo import VideoGenerator, SamplingParam
-# MODEL_NAME = '"Wan-AI/Wan2.1-T2V-1.3B-Diffusers",'
-MODEL_NAME = 'Wan-AI/Wan2.1-T2V-14B'
+MODEL_NAME = '"Wan-AI/Wan2.1-T2V-1.3B-Diffusers",'
+# MODEL_NAME = 'Wan-AI/Wan2.1-T2V-14B'
 def main():
     # set the attention backend 
     os.environ["FASTVIDEO_ATTENTION_BACKEND"] = "FLASH_ATTN"
