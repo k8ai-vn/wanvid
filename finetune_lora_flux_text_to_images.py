@@ -398,7 +398,7 @@ class Model:
         import os
         
         # Login to Hugging Face Hub to access gated models
-        login(token="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")
+        login(token="")
         
         # Store models by user_id
         self.user_models = {}
