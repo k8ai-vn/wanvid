@@ -89,8 +89,8 @@ image = (
 
 # S3 Configuration
 S3_BUCKET = 'ttv-storage'
-S3_ACCESS_KEY = '0b762a408ed9101030b7d79189a67410'
-S3_SECRET_KEY = '30e1f3a43c87191ff5cb5b829e224b12'
+S3_ACCESS_KEY = ''
+S3_SECRET_KEY = ''
 
 # Initialize S3 client
 bucket_url = 'https://eu2.contabostorage.com/'
