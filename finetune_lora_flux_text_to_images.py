@@ -7,11 +7,13 @@ import uuid
 from typing import Optional
 import time
 import sys
+import glob
 
 # Building up the environment
 app = modal.App(name="flux-text-to-images")
 
-image = modal.Image.debian_slim(python_version="3.10").pip_install(
+# Create base image with common dependencies
+base_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "accelerate",
     "datasets~=2.13.0",
     "fastapi[standard]==0.115.4",
@@ -33,7 +35,6 @@ image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "boto3",
     "imageio",
     "imageio-ffmpeg",
-    "diffusers==0.33.1",
     "pyyaml",
     "opencv-python",
     "einops",
@@ -42,14 +43,68 @@ image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "spaces"
 )
 
-# Add ltx_video_distilled directory to the image
-image = image.add_local_dir(
+# Create two different images with different diffusers versions
+image_dev = base_image.pip_install("diffusers==0.33.1")  # For FLUX.1-dev
+# image_stable = base_image.pip_install("diffusers==0.32.0")  # For FLUX.1
+
+# Add ltx_video_distilled directory to both images
+image_dev = image_dev.add_local_dir(
     Path(__file__).parent / "ltx_video_distilled",
     remote_path="/root/ltx_video_distilled",
     copy=True
 )
 
-with image.imports():  # loaded on all of our remote Functions
+image_stable = base_image.add_local_dir(
+    Path(__file__).parent / "ltx_video_distilled",
+    remote_path="/root/ltx_video_distilled",
+    copy=True
+)
+
+# Update the GIT_SHA for each version
+GIT_SHA_DEV = "e649678bf55aeaa4b60bd1f68b1ee726278c0304"  # For FLUX.1-dev
+GIT_SHA_STABLE = "e649678bf55aeaa4b60bd1f68b1ee726278c0304"  # For FLUX.1
+
+# # Setup git for both images
+# image_dev = (
+#     image_dev.apt_install("git", "ffmpeg")
+#     .run_commands(
+#         "cd /root && git init .",
+#         "cd /root && git remote add origin https://github.com/huggingface/diffusers",
+#         f"cd /root && git fetch --depth=1 origin {GIT_SHA_DEV} && git checkout {GIT_SHA_DEV}",
+#         "cd /root && pip install -e .",
+#     )
+# )
+image_dev = (
+    image_dev.apt_install("git", "ffmpeg")
+)
+
+image_stable = (
+    image_stable.apt_install("git", "ffmpeg")
+    .run_commands(
+        "cd /root && git init .",
+        "cd /root && git remote add origin https://github.com/huggingface/diffusers",
+        f"cd /root && git fetch --depth=1 origin {GIT_SHA_STABLE} && git checkout {GIT_SHA_STABLE}",
+        "cd /root && pip install -e .",
+    )
+)
+
+with image_dev.imports():  # loaded on all of our remote Functions
+    import sys
+    import os
+    from pathlib import Path
+    # Add ltx_video_distilled to Python path
+    sys.path.append("/root/ltx_video_distilled")
+    sys.path.append("/root/ltx_video_distilled/configs")
+    # Ensure configs directory exists
+    configs_dir = Path("/root/ltx_video_distilled/configs")
+    if not configs_dir.exists():
+        configs_dir.mkdir(parents=True, exist_ok=True)
+    
+    import torch
+    from PIL import Image
+    import yaml
+
+with image_stable.imports():
     import sys
     import os
     from pathlib import Path
@@ -65,32 +120,11 @@ with image.imports():  # loaded on all of our remote Functions
     import torch
     from PIL import Image
     import yaml
-
-# ### Downloading scripts and installing a git repo with `run_commands`
-
-# We'll use an example script from the `diffusers` library to train the model.
-# We acquire it from GitHub and install it in our environment with a series of commands.
-# The container environments Modal Functions run in are highly flexible --
-# see [the docs](https://modal.com/docs/guide/custom-container) for more details.
-
-GIT_SHA = "e649678bf55aeaa4b60bd1f68b1ee726278c0304"  # specify the commit to fetch
-
-image = (
-    image.apt_install("git", "ffmpeg")
-    # Perform a shallow fetch of just the target `diffusers` commit, checking out
-    # the commit in the container's home directory, /root. Then install `diffusers`
-    .run_commands(
-        "cd /root && git init .",
-        "cd /root && git remote add origin https://github.com/huggingface/diffusers",
-        f"cd /root && git fetch --depth=1 origin {GIT_SHA} && git checkout {GIT_SHA}",
-        # "cd /root && pip install -e .",
-    )
-)
-
+    
 # S3 Configuration
 S3_BUCKET = 'ttv-storage'
-S3_ACCESS_KEY = ''
-S3_SECRET_KEY = ''
+S3_ACCESS_KEY = '0b762a408ed9101030b7d79189a67410'
+S3_SECRET_KEY = '30e1f3a43c87191ff5cb5b829e224b12'
 
 # Initialize S3 client
 bucket_url = 'https://eu2.contabostorage.com/'
@@ -158,6 +192,7 @@ class SharedConfig:
     user_id: str = "default"
     # Whether to use finetuned model or base model
     use_finetuned: bool = True
+    use_dev_version: bool = True  # New flag to control which version to use
     
 # Storing data created by our app with modal.Volume
 volume = modal.Volume.from_name(
@@ -180,10 +215,15 @@ s3_secret = modal.Secret.from_dict({
     "S3_SECRET_KEY": S3_SECRET_KEY
 })
 
-image = image.env(
+image_dev = image_dev.env(
     {"HF_HUB_ENABLE_HF_TRANSFER": "1",
      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}  # turn on faster downloads from HF
 )
+
+image_stable = image_stable.env(
+    {"HF_HUB_ENABLE_HF_TRANSFER": "1",
+     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}  # turn on faster downloads from HF
+)   
 
 def get_model_dir(config):
     """Get the appropriate model directory based on user and settings."""
@@ -195,7 +235,7 @@ def get_model_dir(config):
 
 @app.function(
     volumes={MODEL_DIR: volume},
-    image=image,
+    image=image_dev,
     secrets=[huggingface_secret, s3_secret],
     timeout=600,  # 10 minutes
 )
@@ -283,7 +323,7 @@ class TrainConfig(SharedConfig):
 
 
 @app.function(
-    image=image,
+    image=image_stable,
     gpu="A100-80GB",  # fine-tuning is VRAM-heavy and requires a high-VRAM GPU
     volumes={MODEL_DIR: volume},  # stores fine-tuned model
     timeout=1800,  # 30 minutes
@@ -295,14 +335,28 @@ class TrainConfig(SharedConfig):
     ),
 )
 def train(instance_example_urls, config):
+    # Use the appropriate image based on config
+    # if not config.use_dev_version:
+    #     # Switch to stable image
+    #     train.function.image = image_stable
+    
     import subprocess
     from accelerate.utils import write_basic_config
     import shutil
+    import time
 
     # Create user directory if it doesn't exist
     user_model_dir = get_model_dir(config)
     os.makedirs(user_model_dir, exist_ok=True)
-    
+    # # Remove pytorch_lora_weights.safetensors
+    # rm_old_finetune_model_dir = os.path.join(MODEL_DIR, USER_MODELS_DIR, config.user_id)
+    # # Remove old lora weights folders
+    # lora_weights_folders = ["lora_weights_John-Body.png"]
+    # for folder in lora_weights_folders:
+    #     folder_path = os.path.join(rm_old_finetune_model_dir, folder)
+    #     if os.path.exists(folder_path):
+    #         shutil.rmtree(folder_path)
+            
     # If user model doesn't exist, copy base model to user directory
     if not os.path.exists(os.path.join(user_model_dir, "model_index.json")):
         print(f"Copying base model to user directory: {user_model_dir}")
@@ -318,13 +372,20 @@ def train(instance_example_urls, config):
 
     # load data locally
     img_path = load_images(instance_example_urls)
-
+    print('Loaded images')
     # set up hugging face accelerate library for fast training
     write_basic_config(mixed_precision="bf16")
 
     # define the training prompt
     instance_phrase = f"{config.instance_name} the {config.class_name}"
     prompt = f"{config.prefix} {instance_phrase} {config.postfix}".strip()
+
+    # Generate timestamp for unique filename
+    # timestamp = int(time.time())
+    # Get file name from instance_example_urls
+    file_name = instance_example_urls[0].split('/')[-1].split('.')[0]
+    output_dir = os.path.join(user_model_dir, f"lora_weights_{file_name}")
+    os.makedirs(output_dir, exist_ok=True)
 
     # the model training is packaged as a script, so we have to execute it as a subprocess, which adds some boilerplate
     def _exec_subprocess(cmd: list[str]):
@@ -352,7 +413,7 @@ def train(instance_example_urls, config):
             "--mixed_precision=bf16",  # half-precision floats most of the time for faster training
             f"--pretrained_model_name_or_path={user_model_dir}",
             f"--instance_data_dir={img_path}",
-            f"--output_dir={user_model_dir}",
+            f"--output_dir={output_dir}",  # Use the timestamped output directory
             f"--instance_prompt={prompt}",
             f"--resolution={config.resolution}",
             f"--train_batch_size={config.train_batch_size}",
@@ -384,21 +445,28 @@ def train(instance_example_urls, config):
 """ 
 Running our model
 """
-@app.cls(image=image, 
-         gpu="A100-80GB", 
-         volumes={MODEL_DIR: volume,
-                  OUTPUT_PATH: output_volume}, 
-         secrets=[s3_secret])
+@app.cls(
+    image=image_dev,  # Default to dev image
+    gpu="A100-80GB", 
+    volumes={MODEL_DIR: volume,
+             OUTPUT_PATH: output_volume}, 
+    secrets=[s3_secret]
+)
 class Model:
     @modal.enter()
     def load_model(self):
+        # Use the appropriate image based on config
+        # if not self.config.use_dev_version:
+        #     # Switch to stable image
+        #     Model.cls.image = image_stable
+            
         import torch
         from diffusers import DiffusionPipeline
         from huggingface_hub import login
         import os
         
         # Login to Hugging Face Hub to access gated models
-        login(token="")
+        login(token="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")
         
         # Store models by user_id
         self.user_models = {}
@@ -416,6 +484,7 @@ class Model:
         """Get or create a pipeline for the specified user configuration."""
         from diffusers import DiffusionPipeline
         import os
+        import glob
         
         # If not using finetuned model, return base model
         if not config.use_finetuned:
@@ -439,14 +508,33 @@ class Model:
             torch_dtype=torch.bfloat16,
         ).to("cuda")
         
-        # Check for LoRA weights
-        weight_files = [f for f in os.listdir(model_dir) if f.endswith(".safetensors") or f.endswith(".bin")]
-        print(f'weight_files for user {config.user_id}:', weight_files)
-        if len(weight_files) > 2:
-            print(f"Loading LoRA weights from {weight_files[0]} for user {config.user_id}")
-            pipe.load_lora_weights(model_dir)
+        # Find all LoRA weight directories
+        lora_dirs = glob.glob(os.path.join(model_dir, "lora_weights_*"))
+        if lora_dirs:
+            if config.use_all_models:
+                # Load all available LoRA weights
+                print(f"Loading all available LoRA weights for user {config.user_id}")
+                for lora_dir in lora_dirs:
+                    model_name = os.path.basename(lora_dir).replace("lora_weights_", "")
+                    print(f"Loading LoRA weights from {lora_dir} with adapter name {model_name}")
+                    pipe.load_lora_weights(lora_dir)
+            elif config.lora_model_name:
+                # If specific model is requested, try to find it
+                target_dir = os.path.join(model_dir, f"lora_weights_{config.lora_model_name}")
+                if target_dir in lora_dirs:
+                    print(f"Loading specified LoRA weights from {target_dir} for user {config.user_id}")
+                    pipe.load_lora_weights(target_dir)
+                else:
+                    print(f"Specified LoRA model {config.lora_model_name} not found, using latest")
+                    latest_lora_dir = max(lora_dirs, key=os.path.getmtime)
+                    pipe.load_lora_weights(latest_lora_dir)
+            else:
+                # If no specific model requested, use latest
+                latest_lora_dir = max(lora_dirs, key=os.path.getmtime)
+                print(f"Loading latest LoRA weights from {latest_lora_dir} for user {config.user_id}")
+                pipe.load_lora_weights(latest_lora_dir)
         else:
-            print(f"Skipping LoRA weight loading for user {config.user_id}. Found {len(weight_files)} weight files.")
+            print(f"No LoRA weights found for user {config.user_id}")
             
         # Cache the model
         self.user_models[config.user_id] = pipe
@@ -457,7 +545,7 @@ class Model:
         import tempfile
         import PIL.Image
         import io
-        
+        clear_memory()
         # Get the appropriate pipeline for this user
         pipe = self.get_pipe_for_user(config)
         
@@ -499,6 +587,8 @@ class Model:
         import tempfile
         import os
         print('input seed ', seed)
+        
+        clear_memory()
         random_seed = seed if seed else int(time.time())
         seed = random_seed if seed is None else seed
         print('random seed ', random_seed)
@@ -583,9 +673,11 @@ class AppConfig(SharedConfig):
 
     num_inference_steps: int = 50
     guidance_scale: float = 6
+    lora_model_name: Optional[str] = None  # Add field to specify which LoRA model to use
+    use_all_models: bool = False  # Add field to specify if all models should be used
 
 
-web_image = image.add_local_dir(
+web_image = image_dev.add_local_dir(
     # Add local web assets to the image
     Path(__file__).parent / "assets",
     remote_path="/assets",
@@ -605,19 +697,36 @@ def fastapi_app():
     from fastapi.responses import FileResponse, RedirectResponse
     from gradio.routes import mount_gradio_app
     import json
+    import glob
+    import os
     
     # download_models.remote(SharedConfig())
     web_app = FastAPI()
 
+    # Function to get available LoRA models for a user
+    def get_available_lora_models(user_id):
+        try:
+            model_dir = os.path.join(MODEL_DIR, USER_MODELS_DIR, user_id)
+            lora_dirs = glob.glob(os.path.join(model_dir, "lora_weights_*"))
+            if lora_dirs:
+                # Extract model names from directory names
+                model_names = [os.path.basename(d).replace("lora_weights_", "") for d in lora_dirs]
+                return model_names
+            return []
+        except:
+            return []
+
     # Call out to the inference in a separate Modal environment with a GPU
-    def go(text="", user_id="default", use_finetuned=True):
+    def go(text="", user_id="default", use_finetuned=True, lora_model_name=None, use_all_models=False):
         if not text:
             text = example_prompts[0]
         
         # Create config with user settings
         user_config = AppConfig(
             user_id=user_id,
-            use_finetuned=use_finetuned
+            use_finetuned=use_finetuned,
+            lora_model_name=lora_model_name,
+            use_all_models=use_all_models
         )
         
         # Generate 4 images instead of 1
@@ -626,31 +735,6 @@ def fastapi_app():
             image_urls.append(Model().inference.remote(text, user_config))
         return image_urls
     
-    # Function to upload image to S3 and then generate video
-    def generate_video(image, prompt, negative_prompt=None, num_frames=None, num_inference_steps=None, seed=None, width=768, height=512):
-        if not image:
-            return None
-        
-        if not prompt:
-            prompt = "A short video clip"
-            
-        # Read image file as bytes
-        with open(image, 'rb') as f:
-            image_bytes = f.read()
-            
-        # Call the image_to_video method
-        video_url = Model().image_to_video.remote(
-            image_bytes=image_bytes,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            width=width,
-            height=height
-        )
-        return video_url
-
     # Function to start training from UI
     def start_training(user_id, instance_name, class_name, image_urls, max_train_steps, prefix, postfix):
         if not user_id or user_id == "new_user":
@@ -759,6 +843,7 @@ def fastapi_app():
         # Store user settings
         user_id = gr.State("default")
         use_finetuned = gr.State(True)
+        use_all_models = gr.State(False)
         
         gr.Markdown(
             f"# Generate images of {instance_phrase}.\n\n{description}",
@@ -783,6 +868,17 @@ def fastapi_app():
                             label="Use Finetuned Model",
                             value=True
                         )
+                        use_all_models_checkbox = gr.Checkbox(
+                            label="Use All Finetune Models",
+                            value=False,
+                            visible=False
+                        )
+                        lora_model_dropdown = gr.Dropdown(
+                            label="Select LoRA Model",
+                            choices=get_available_lora_models(user_id),
+                            value=None,
+                            visible=False
+                        )
                         
                         # Update user dropdown when page loads
                         def update_user_list():
@@ -801,10 +897,44 @@ def fastapi_app():
                             else:
                                 return gr.Textbox(visible=False), choice
                         
+                        # Update LoRA model dropdown when user changes
+                        def update_lora_models(user_id):
+                            if user_id and user_id != "new_user":
+                                models = get_available_lora_models(user_id)
+                                return gr.Dropdown(choices=models, visible=len(models) > 0)
+                            return gr.Dropdown(choices=[], visible=False)
+                        
+                        # Update UI elements based on use_finetuned
+                        def toggle_finetune_options(use_finetuned):
+                            if use_finetuned:
+                                models = get_available_lora_models(user_id.value)
+                                return gr.Checkbox(visible=True), gr.Dropdown(choices=models, visible=len(models) > 0)
+                            return gr.Checkbox(visible=False), gr.Dropdown(visible=False)
+                        
+                        # Update LoRA model visibility based on use_all_models
+                        def toggle_lora_model_visibility(use_all_models):
+                            return gr.Dropdown(visible=not use_all_models)
+                        
                         user_dropdown.change(
                             toggle_new_user_input,
                             inputs=[user_dropdown],
                             outputs=[new_user_input, user_id]
+                        ).then(
+                            update_lora_models,
+                            inputs=[user_id],
+                            outputs=[lora_model_dropdown]
+                        )
+                        
+                        use_finetuned_checkbox.change(
+                            toggle_finetune_options,
+                            inputs=[use_finetuned_checkbox],
+                            outputs=[use_all_models_checkbox, lora_model_dropdown]
+                        )
+                        
+                        use_all_models_checkbox.change(
+                            toggle_lora_model_visibility,
+                            inputs=[use_all_models_checkbox],
+                            outputs=[lora_model_dropdown]
                         )
                         
                         # Update user_id when new user is created
@@ -817,6 +947,10 @@ def fastapi_app():
                             update_user_id,
                             inputs=[new_user_input],
                             outputs=[user_id]
+                        ).then(
+                            update_lora_models,
+                            inputs=[user_id],
+                            outputs=[lora_model_dropdown]
                         )
                         
                         # Update use_finetuned state
@@ -824,6 +958,13 @@ def fastapi_app():
                             lambda x: x,
                             inputs=[use_finetuned_checkbox],
                             outputs=[use_finetuned]
+                        )
+                        
+                        # Update use_all_models state
+                        use_all_models_checkbox.change(
+                            lambda x: x,
+                            inputs=[use_all_models_checkbox],
+                            outputs=[use_all_models]
                         )
                     
                     with gr.Column(scale=3):
@@ -842,7 +983,7 @@ def fastapi_app():
                     btn = gr.Button("Dream", variant="primary", scale=2)
                     btn.click(
                         fn=go, 
-                        inputs=[inp, user_id, use_finetuned], 
+                        inputs=[inp, user_id, use_finetuned, lora_model_dropdown, use_all_models], 
                         outputs=out
                     )  # connect inputs and outputs with inference function
 

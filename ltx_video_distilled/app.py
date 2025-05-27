@@ -12,6 +12,21 @@ from PIL import Image
 from huggingface_hub import hf_hub_download
 import shutil
 import ltx_video_distilled as ltx_video
+
+# Set GPU memory optimization
+def clear_memory():
+    import torch
+    print('clearing memory....')
+    # Free up memory
+    torch.cuda.empty_cache()
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Force garbage collection
+        import gc
+        gc.collect()
+    print('memory cleared')
+    
 from inference import (
     create_ltx_video_pipeline,
     create_latent_upsampler,
@@ -73,7 +88,7 @@ pipeline_instance = create_ltx_video_pipeline(
     prompt_enhancer_llm_model_name_or_path=PIPELINE_CONFIG_YAML["prompt_enhancer_llm_model_name_or_path"],
 )
 print("LTX Video pipeline created on CPU.")
-
+clear_memory()
 if PIPELINE_CONFIG_YAML.get("spatial_upscaler_model_path"):
     print("Creating latent upsampler on CPU...")
     latent_upsampler_instance = create_latent_upsampler(
@@ -84,6 +99,7 @@ if PIPELINE_CONFIG_YAML.get("spatial_upscaler_model_path"):
 
 target_inference_device = "cuda"
 print(f"Target inference device: {target_inference_device}")
+clear_memory()
 pipeline_instance.to(target_inference_device)
 if latent_upsampler_instance: 
     latent_upsampler_instance.to(target_inference_device)
@@ -322,6 +338,7 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
         except Exception as e2:
             print(f"Fallback video saving error: {e2}")
             return None
+    clear_memory()
     return output_video_path, seed_ui
 
 def update_task_image():

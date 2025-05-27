@@ -67,7 +67,19 @@ def get_device():
         return "mps"
     return "cpu"
 
-
+def clear_memory():
+    import torch
+    print('clearing memory....')
+    # Free up memory
+    torch.cuda.empty_cache()
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Force garbage collection
+        import gc
+        gc.collect()
+    print('memory cleared')
+    
 def load_image_to_tensor_with_resize_and_crop(
     image_input: Union[str, Image.Image],
     target_height: int = 512,
