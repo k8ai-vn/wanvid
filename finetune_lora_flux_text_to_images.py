@@ -9,11 +9,47 @@ import time
 import sys
 import glob
 
+# List of fake users
+FAKE_USERS = [
+    "default",
+    "user1",
+    "user2", 
+    "user3",
+    "user4",
+    "user5",
+    "user6",
+    "user7",
+    "user8",
+    "user9",
+    "user10"
+]
+
 # Building up the environment
 app = modal.App(name="flux-text-to-images")
 
 # Create base image with common dependencies
-base_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+# cuda_version = "12.4.0"  # should be no greater than host CUDA version
+# flavor = "devel"  # includes full CUDA toolkit
+# operating_sys = "ubuntu22.04"
+# tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
+# cuda_dev_image = modal.Image.from_registry(
+#     f"nvidia/cuda:{tag}", add_python="3.11"
+# ).entrypoint([])
+cuda_version = "12.8.0"  # should be no greater than host CUDA version
+flavor = "devel"  #  includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
+base_image = modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11"
+    ).pip_install(  # required to build flash-attn
+        "ninja",
+        "packaging",
+        "wheel",
+        "torch==2.6.0",
+    ).pip_install(  # add flash-attn
+        "flash-attn==2.7.4.post1", extra_options="--no-build-isolation"
+    ).pip_install(
     "accelerate",
     "datasets~=2.13.0",
     "fastapi[standard]==0.115.4",
@@ -28,9 +64,9 @@ base_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "smart_open~=6.4.0",
     "starlette==0.41.2",
     "transformers~=4.41.2",
-    "torch~=2.2.0",
+    #"torch==2.6.0",
     "torchvision~=0.16",
-    "triton~=2.2.0",
+    "triton~=3.2.0",
     "wandb==0.17.6",
     "boto3",
     "imageio",
@@ -40,7 +76,7 @@ base_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "einops",
     "timm",
     "av",
-    "spaces"
+    "spaces",
 )
 
 # Create two different images with different diffusers versions
@@ -51,6 +87,11 @@ image_dev = base_image.pip_install("diffusers==0.33.1")  # For FLUX.1-dev
 image_dev = image_dev.add_local_dir(
     Path(__file__).parent / "ltx_video_distilled",
     remote_path="/root/ltx_video_distilled",
+    copy=True
+)
+image_dev = image_dev.add_local_dir(
+    Path(__file__).parent / "Phantom",
+    remote_path="/root/Phantom",
     copy=True
 )
 
@@ -76,6 +117,16 @@ GIT_SHA_STABLE = "e649678bf55aeaa4b60bd1f68b1ee726278c0304"  # For FLUX.1
 # )
 image_dev = (
     image_dev.apt_install("git", "ffmpeg")
+    .run_commands(
+        "cd /root/Phantom && pip install -r requirements.txt",
+        #"git clone https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl",
+       # "pip install --upgrade pip setuptools wheel",
+        #"pip install ninja packaging",
+        #"cd flash-attention && export FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE && python setup.py install"
+        # "export FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE",
+        # "pip install flash-attn"
+        #"pip install --no-cache-dir flash-attn==2.7.4.post1 --no-build-isolation"
+    )
 )
 
 image_stable = (
@@ -95,6 +146,7 @@ with image_dev.imports():  # loaded on all of our remote Functions
     # Add ltx_video_distilled to Python path
     sys.path.append("/root/ltx_video_distilled")
     sys.path.append("/root/ltx_video_distilled/configs")
+    sys.path.append("/root/Phantom")
     # Ensure configs directory exists
     configs_dir = Path("/root/ltx_video_distilled/configs")
     if not configs_dir.exists():
@@ -198,7 +250,17 @@ class SharedConfig:
 volume = modal.Volume.from_name(
     "flux-text-to-images-data", create_if_missing=True
 )
+volume_wan_phantom_14b = modal.Volume.from_name(
+    "data-wan-phantom-14b", 
+    create_if_missing=True
+)
+volume_wan21 = modal.Volume.from_name(
+    "data-wan21", 
+    create_if_missing=True
+)
 MODEL_DIR = "/model"
+MODEL_DIR_PHANTOM = "/model-wan-phantom-14b"
+MODEL_DIR_WAN21_T2V_13B = "/model-wan21-t2v-13b"
 OUTPUT_PATH = "/output"
 USER_MODELS_DIR = "user_models"
 USE_WANDB = False
@@ -234,7 +296,9 @@ def get_model_dir(config):
     return user_model_dir
 
 @app.function(
-    volumes={MODEL_DIR: volume},
+    volumes={MODEL_DIR: volume,
+             MODEL_DIR_PHANTOM: volume_wan_phantom_14b,
+             MODEL_DIR_WAN21_T2V_13B: volume_wan21},
     image=image_dev,
     secrets=[huggingface_secret, s3_secret],
     timeout=600,  # 10 minutes
@@ -254,10 +318,24 @@ def download_models(config):
         DiffusionPipeline.from_pretrained(MODEL_DIR, torch_dtype=torch.bfloat16)
     
     # Create user directory if it doesn't exist
-    if config.use_finetuned:
         user_model_dir = get_model_dir(config)
         os.makedirs(user_model_dir, exist_ok=True)
-    
+    print("Preparing download")
+    # Download Phantom-Wan model if using fine-tuning and it doesn't exist
+    if not os.path.exists(os.path.join(MODEL_DIR_PHANTOM, "README.md")):
+        print('Downloading Phantom-Wan model')
+        snapshot_download(
+            "bytedance-research/Phantom",
+            local_dir=os.path.join(MODEL_DIR_PHANTOM),
+            # ignore_patterns=["*.pt", "*.bin"]  # using safetensors
+        )
+    # Download Wan2.1-T2V-1.3B model if it doesn't exist
+    if not os.path.exists(os.path.join(MODEL_DIR_WAN21_T2V_13B, "README.md")):
+        print('Downloading Wan2.1-T2V-1.3B model')
+        snapshot_download(
+            "Wan-AI/Wan2.1-T2V-1.3B",
+            local_dir=os.path.join(MODEL_DIR_WAN21_T2V_13B),
+        )
 # Load fine-tuning dataset
 # Part of the magic of the low-rank fine-tuning is that we only need 3-10 images for fine-tuning. 
 # So we can fetch just a few images, stored on consumer platforms like Imgur or Google Drive, 
@@ -303,6 +381,7 @@ class TrainConfig(SharedConfig):
     # training prompt looks like `{PREFIX} {INSTANCE_NAME} the {CLASS_NAME} {POSTFIX}`
     prefix: str = "a cinematic portrait of"
     postfix: str = "in a mysterious foggy forest, glowing amulet around his neck, cinematic lighting"
+    model_name: Optional[str] = None  # Add field for custom model name
 
     # locator for plaintext file with urls for images of target instance
     instance_example_urls_file: str = str(
@@ -348,14 +427,6 @@ def train(instance_example_urls, config):
     # Create user directory if it doesn't exist
     user_model_dir = get_model_dir(config)
     os.makedirs(user_model_dir, exist_ok=True)
-    # # Remove pytorch_lora_weights.safetensors
-    # rm_old_finetune_model_dir = os.path.join(MODEL_DIR, USER_MODELS_DIR, config.user_id)
-    # # Remove old lora weights folders
-    # lora_weights_folders = ["lora_weights_John-Body.png"]
-    # for folder in lora_weights_folders:
-    #     folder_path = os.path.join(rm_old_finetune_model_dir, folder)
-    #     if os.path.exists(folder_path):
-    #         shutil.rmtree(folder_path)
             
     # If user model doesn't exist, copy base model to user directory
     if not os.path.exists(os.path.join(user_model_dir, "model_index.json")):
@@ -380,10 +451,13 @@ def train(instance_example_urls, config):
     instance_phrase = f"{config.instance_name} the {config.class_name}"
     prompt = f"{config.prefix} {instance_phrase} {config.postfix}".strip()
 
-    # Generate timestamp for unique filename
-    # timestamp = int(time.time())
-    # Get file name from instance_example_urls
+    # Get file name from instance_example_urls or use timestamp
     file_name = instance_example_urls[0].split('/')[-1].split('.')[0]
+    if hasattr(config, 'model_name') and config.model_name:
+        file_name = config.model_name
+    else:
+        file_name = f"{file_name}_{int(time.time())}"
+        
     output_dir = os.path.join(user_model_dir, f"lora_weights_{file_name}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -442,6 +516,127 @@ def train(instance_example_urls, config):
     volume.commit()
     clear_memory()
 
+@app.function(
+    image=image_dev,
+    gpu="A100-80GB",
+    #gpu="H100:8",
+    volumes={MODEL_DIR: volume,
+             MODEL_DIR_PHANTOM: volume_wan_phantom_14b,
+             MODEL_DIR_WAN21_T2V_13B: volume_wan21,
+             OUTPUT_PATH: output_volume},
+    secrets=[s3_secret],
+    timeout=1800,  # 30 minutes
+)
+def phantom_generation(
+    ref_image_urls: list[str],
+    prompt: str,
+    width: int = 832,
+    height: int = 480,
+    seed: int = 42,
+):
+    """Generate a video using Phantom model with reference images."""
+    import tempfile
+    import os
+    import subprocess
+    from smart_open import open
+    
+    # Download and save reference images temporarily
+    ref_image_paths = []
+    for i, url in enumerate(ref_image_urls):
+        temp_path = f"/tmp/ref_{i}.png"
+        with open(url, "rb") as f:
+            with open(temp_path, "wb") as out_f:
+                out_f.write(f.read())
+        ref_image_paths.append(temp_path)
+    
+    ref_images_str = ",".join(ref_image_paths)
+    print('ref_images_str', ref_images_str)
+    print('generating video..............')
+
+    # Execute command in terminal
+    #phantom_ckpt = os.path.join(MODEL_DIR_PHANTOM, "Phantom-Wan-1.3B.pth")
+    phantom_ckpt = os.path.join(MODEL_DIR_PHANTOM)
+    print('current pwd', os.getcwd())
+    # list directory contents
+    print('directory contents', os.listdir(os.getcwd()))
+    # the model training is packaged as a script, so we have to execute it as a subprocess, which adds some boilerplate
+    def _exec_subprocess(cmd: list[str]):
+        """Executes subprocess and prints log to terminal while subprocess is running."""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        with process.stdout as pipe:
+            for line in iter(pipe.readline, b""):
+                line_str = line.decode()
+                print(f"{line_str}", end="")
+
+        if exitcode := process.wait() != 0:
+            raise subprocess.CalledProcessError(exitcode, "\n".join(cmd))
+    # cmd = ["python3", 
+    #        "Phantom/generate.py", 
+    #        "--task", 
+    #        "s2v-13B", 
+    #        "--size", "814*814", 
+    #        "--ckpt_dir", MODEL_DIR_WAN21_T2V_13B, 
+    #        "--phantom_ckpt", phantom_ckpt, 
+    #        "--ref_image", ref_images_str, 
+    #        "--prompt", prompt, 
+    #        "--base_seed", str(seed)]
+    # print('cmd', cmd)
+    # --task: (choose from 's2v-1.3B', 's2v-14B', 't2v-14B', 't2v-1.3B', 'i2v-14B', 't2i-14B')
+    # --size: (choose from '720*1280', '1280*720', '480*832', '832*480', '1024*1024')
+    user_uuid = "default-test-img-2-video"
+    _exec_subprocess(
+        [
+            "python3",
+            "Phantom/generate.py",
+            "--task", "s2v-14B",
+            "--size", "832*480",
+            "--ckpt_dir", MODEL_DIR_WAN21_T2V_13B,
+            "--phantom_ckpt", phantom_ckpt,
+            "--ref_image", ref_images_str,
+            "--prompt", prompt,
+            "--base_seed", "42",
+            "--user_uuid", user_uuid,
+        ]
+    )
+    # # Convert command string to list of arguments
+    # cmd = [
+    #     "python3", "Phantom/generate.py",
+    #     "--task", "s2v-13B",
+    #     "--size", "814*814",
+    #     "--ckpt_dir", MODEL_DIR_WAN21_T2V_13B,
+    #     "--phantom_ckpt", phantom_ckpt,
+    #     "--ref_image", ref_images_str,
+    #     "--prompt", prompt,
+    #     "--base_seed", str(seed)
+    # ]
+    # print('cmd', cmd)
+    
+    # # Run command and capture output
+    # process = subprocess.Popen(
+    #     cmd,
+    #     stdout=subprocess.PIPE,
+    #     stderr=subprocess.STDOUT,
+    #     shell=False  # Don't use shell
+    # )
+    # print('process', process)
+    
+    # # Print output in real-time
+    # with process.stdout as pipe:
+    #     for line in iter(pipe.readline, b""):
+    #         print(line.decode(), end="")
+            
+    # # Wait for process to complete and check return code
+    # retcode = process.wait()
+    # print('process.wait()', retcode)
+    
+    # if retcode != 0:
+    #     raise subprocess.CalledProcessError(retcode, cmd)
+    # print('process completed')
+
 """ 
 Running our model
 """
@@ -449,9 +644,11 @@ Running our model
     image=image_dev,  # Default to dev image
     gpu="A100-80GB", 
     volumes={MODEL_DIR: volume,
+             MODEL_DIR_PHANTOM: volume_wan_phantom_14b,
              OUTPUT_PATH: output_volume}, 
     secrets=[s3_secret]
 )
+
 class Model:
     @modal.enter()
     def load_model(self):
@@ -511,28 +708,13 @@ class Model:
         # Find all LoRA weight directories
         lora_dirs = glob.glob(os.path.join(model_dir, "lora_weights_*"))
         if lora_dirs:
-            if config.use_all_models:
-                # Load all available LoRA weights
-                print(f"Loading all available LoRA weights for user {config.user_id}")
-                for lora_dir in lora_dirs:
-                    model_name = os.path.basename(lora_dir).replace("lora_weights_", "")
-                    print(f"Loading LoRA weights from {lora_dir} with adapter name {model_name}")
-                    pipe.load_lora_weights(lora_dir)
-            elif config.lora_model_name:
+            if config.lora_model_name:
                 # If specific model is requested, try to find it
                 target_dir = os.path.join(model_dir, f"lora_weights_{config.lora_model_name}")
+                print(f"Loading specified LoRA weights from {target_dir} for user {config.user_id}")
                 if target_dir in lora_dirs:
                     print(f"Loading specified LoRA weights from {target_dir} for user {config.user_id}")
                     pipe.load_lora_weights(target_dir)
-                else:
-                    print(f"Specified LoRA model {config.lora_model_name} not found, using latest")
-                    latest_lora_dir = max(lora_dirs, key=os.path.getmtime)
-                    pipe.load_lora_weights(latest_lora_dir)
-            else:
-                # If no specific model requested, use latest
-                latest_lora_dir = max(lora_dirs, key=os.path.getmtime)
-                print(f"Loading latest LoRA weights from {latest_lora_dir} for user {config.user_id}")
-                pipe.load_lora_weights(latest_lora_dir)
         else:
             print(f"No LoRA weights found for user {config.user_id}")
             
@@ -674,7 +856,6 @@ class AppConfig(SharedConfig):
     num_inference_steps: int = 50
     guidance_scale: float = 6
     lora_model_name: Optional[str] = None  # Add field to specify which LoRA model to use
-    use_all_models: bool = False  # Add field to specify if all models should be used
 
 
 web_image = image_dev.add_local_dir(
@@ -688,6 +869,7 @@ web_image = image_dev.add_local_dir(
     image=web_image,
     max_containers=1,
     secrets=[s3_secret],
+    volumes={MODEL_DIR: volume},
 )
 @modal.concurrent(max_inputs=1000)
 @modal.asgi_app()
@@ -704,6 +886,7 @@ def fastapi_app():
     web_app = FastAPI()
 
     # Function to get available LoRA models for a user
+    @web_app.get("/api/lora_models")
     def get_available_lora_models(user_id):
         try:
             model_dir = os.path.join(MODEL_DIR, USER_MODELS_DIR, user_id)
@@ -716,17 +899,22 @@ def fastapi_app():
         except:
             return []
 
+    # User management routes
+    @web_app.get("/api/users", response_model=list)
+    def get_users():
+        # Return fake users list
+        return FAKE_USERS
+
     # Call out to the inference in a separate Modal environment with a GPU
-    def go(text="", user_id="default", use_finetuned=True, lora_model_name=None, use_all_models=False):
+    def go(text="", user_id="default", lora_model_name=None):
         if not text:
             text = example_prompts[0]
         
         # Create config with user settings
         user_config = AppConfig(
             user_id=user_id,
-            use_finetuned=use_finetuned,
-            lora_model_name=lora_model_name,
-            use_all_models=use_all_models
+            use_finetuned=True,  # Always use finetuned model
+            lora_model_name=lora_model_name
         )
         
         # Generate 4 images instead of 1
@@ -734,11 +922,11 @@ def fastapi_app():
         for _ in range(4):
             image_urls.append(Model().inference.remote(text, user_config))
         return image_urls
-    
+
     # Function to start training from UI
-    def start_training(user_id, instance_name, class_name, image_urls, max_train_steps, prefix, postfix):
+    def start_training(user_id, instance_name, class_name, image_urls, max_train_steps, prefix, postfix, model_name):
         if not user_id or user_id == "new_user":
-            return "Please select or create a valid user ID"
+            return "Please select a valid user ID"
         
         if not instance_name:
             instance_name = "xJnyz"
@@ -783,19 +971,12 @@ def fastapi_app():
         
         # Start training
         train.remote(urls, train_config)
-        return f"Training started for user {user_id} with {len(urls)} images. This may take some time."
-
-    # User management routes
-    @web_app.get("/api/users", response_model=list)
-    async def get_users():
-        # List directories in USER_MODELS_DIR to get available users
-        try:
-            user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-            user_dirs = [d for d in os.listdir(user_models_path) 
-                        if os.path.isdir(os.path.join(user_models_path, d))]
-            return user_dirs
-        except FileNotFoundError:
-            return []
+        
+        # Generate a model name if not provided
+        if not model_name:
+            model_name = f"{instance_name}_{int(time.time())}"
+            
+        return f"Training started for user {user_id} with {len(urls)} images. Model will be saved as '{model_name}'. This may take some time."
 
     # set up AppConfig
     config = AppConfig()
@@ -842,8 +1023,7 @@ def fastapi_app():
     ) as interface:
         # Store user settings
         user_id = gr.State("default")
-        use_finetuned = gr.State(True)
-        use_all_models = gr.State(False)
+        selected_model = gr.State(None)
         
         gr.Markdown(
             f"# Generate images of {instance_phrase}.\n\n{description}",
@@ -856,96 +1036,37 @@ def fastapi_app():
                         # User settings
                         user_dropdown = gr.Dropdown(
                             label="Select User",
-                            choices=["default", "new_user"],
-                            value="default"
-                        )
-                        new_user_input = gr.Textbox(
-                            label="New User ID",
-                            placeholder="Enter a unique ID for new user",
-                            visible=False
-                        )
-                        use_finetuned_checkbox = gr.Checkbox(
-                            label="Use Finetuned Model",
-                            value=True
-                        )
-                        use_all_models_checkbox = gr.Checkbox(
-                            label="Use All Finetune Models",
-                            value=False,
-                            visible=False
+                            choices=get_users(),
+                            value=get_users()[0]
                         )
                         lora_model_dropdown = gr.Dropdown(
                             label="Select LoRA Model",
-                            choices=get_available_lora_models(user_id),
+                            choices=[],
                             value=None,
-                            visible=False
+                            visible=True
                         )
                         
                         # Update user dropdown when page loads
                         def update_user_list():
-                            try:
-                                user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-                                users = ["default", "new_user"] + [d for d in os.listdir(user_models_path) 
-                                        if os.path.isdir(os.path.join(user_models_path, d)) and d != "default"]
-                                return gr.Dropdown(choices=list(set(users)))
-                            except FileNotFoundError:
-                                return gr.Dropdown(choices=["default", "new_user"])
-                        
-                        # Show/hide new user input based on dropdown selection
-                        def toggle_new_user_input(choice):
-                            if choice == "new_user":
-                                return gr.Textbox(visible=True), "default"
-                            else:
-                                return gr.Textbox(visible=False), choice
+                            return gr.Dropdown(choices=FAKE_USERS)
                         
                         # Update LoRA model dropdown when user changes
                         def update_lora_models(user_id):
-                            if user_id and user_id != "new_user":
-                                models = get_available_lora_models(user_id)
-                                return gr.Dropdown(choices=models, visible=len(models) > 0)
-                            return gr.Dropdown(choices=[], visible=False)
+                            print(f"Updating models for user: {user_id}")
+                            models = get_available_lora_models(user_id)
+                            print(f"Available models: {models}")
+                            
+                            if models:
+                                return gr.Dropdown(choices=models, value=models[0], visible=True)
+                            return gr.Dropdown(choices=[], value=None, visible=True)
                         
-                        # Update UI elements based on use_finetuned
-                        def toggle_finetune_options(use_finetuned):
-                            if use_finetuned:
-                                models = get_available_lora_models(user_id.value)
-                                return gr.Checkbox(visible=True), gr.Dropdown(choices=models, visible=len(models) > 0)
-                            return gr.Checkbox(visible=False), gr.Dropdown(visible=False)
-                        
-                        # Update LoRA model visibility based on use_all_models
-                        def toggle_lora_model_visibility(use_all_models):
-                            return gr.Dropdown(visible=not use_all_models)
-                        
+                        # Update selected model when LoRA dropdown changes
+                        def update_selected_model(model_name):
+                            return model_name
+                            
                         user_dropdown.change(
-                            toggle_new_user_input,
-                            inputs=[user_dropdown],
-                            outputs=[new_user_input, user_id]
-                        ).then(
-                            update_lora_models,
-                            inputs=[user_id],
-                            outputs=[lora_model_dropdown]
-                        )
-                        
-                        use_finetuned_checkbox.change(
-                            toggle_finetune_options,
-                            inputs=[use_finetuned_checkbox],
-                            outputs=[use_all_models_checkbox, lora_model_dropdown]
-                        )
-                        
-                        use_all_models_checkbox.change(
-                            toggle_lora_model_visibility,
-                            inputs=[use_all_models_checkbox],
-                            outputs=[lora_model_dropdown]
-                        )
-                        
-                        # Update user_id when new user is created
-                        def update_user_id(new_id):
-                            if new_id and new_id.strip():
-                                return new_id.strip()
-                            return "default"
-                        
-                        new_user_input.change(
-                            update_user_id,
-                            inputs=[new_user_input],
+                            lambda x: x,
+                            inputs=[user_dropdown], 
                             outputs=[user_id]
                         ).then(
                             update_lora_models,
@@ -953,18 +1074,10 @@ def fastapi_app():
                             outputs=[lora_model_dropdown]
                         )
                         
-                        # Update use_finetuned state
-                        use_finetuned_checkbox.change(
-                            lambda x: x,
-                            inputs=[use_finetuned_checkbox],
-                            outputs=[use_finetuned]
-                        )
-                        
-                        # Update use_all_models state
-                        use_all_models_checkbox.change(
-                            lambda x: x,
-                            inputs=[use_all_models_checkbox],
-                            outputs=[use_all_models]
+                        lora_model_dropdown.change(
+                            update_selected_model,
+                            inputs=[lora_model_dropdown],
+                            outputs=[selected_model]
                         )
                     
                     with gr.Column(scale=3):
@@ -983,7 +1096,7 @@ def fastapi_app():
                     btn = gr.Button("Dream", variant="primary", scale=2)
                     btn.click(
                         fn=go, 
-                        inputs=[inp, user_id, use_finetuned, lora_model_dropdown, use_all_models], 
+                        inputs=[inp, user_id, selected_model], 
                         outputs=out
                     )  # connect inputs and outputs with inference function
 
@@ -1092,13 +1205,8 @@ def fastapi_app():
                     with gr.Column():
                         train_user_dropdown = gr.Dropdown(
                             label="Select User",
-                            choices=["default", "new_user"],
-                            value="default"
-                        )
-                        train_new_user_input = gr.Textbox(
-                            label="New User ID",
-                            placeholder="Enter a unique ID for new user",
-                            visible=False
+                            choices=FAKE_USERS,
+                            value=FAKE_USERS[0]
                         )
                         train_instance_name = gr.Textbox(
                             label="Instance Name",
@@ -1120,6 +1228,11 @@ def fastapi_app():
                             placeholder="Text that comes after the instance name in training prompt",
                             value="in a mysterious foggy forest, glowing amulet around his neck, cinematic lighting"
                         )
+                        train_model_name = gr.Textbox(
+                            label="Model Name",
+                            placeholder="Enter a name for your model (e.g., my_character_v1)",
+                            value=""
+                        )
                         train_image_urls = gr.Textbox(
                             label="Image URLs",
                             placeholder="Enter image URLs (one per line) for training",
@@ -1137,36 +1250,15 @@ def fastapi_app():
                         
                         # Update user dropdown for training tab
                         def update_train_user_list():
-                            try:
-                                user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-                                users = ["default", "new_user"] + [d for d in os.listdir(user_models_path) 
-                                        if os.path.isdir(os.path.join(user_models_path, d)) and d != "default"]
-                                return gr.Dropdown(choices=list(set(users)))
-                            except FileNotFoundError:
-                                return gr.Dropdown(choices=["default", "new_user"])
-                        
-                        # Show/hide new user input based on dropdown selection for training
-                        def toggle_train_new_user_input(choice):
-                            if choice == "new_user":
-                                return gr.Textbox(visible=True)
-                            else:
-                                return gr.Textbox(visible=False)
+                            return gr.Dropdown(choices=FAKE_USERS)
                         
                         train_user_dropdown.change(
-                            toggle_train_new_user_input,
+                            lambda x: x,
                             inputs=[train_user_dropdown],
-                            outputs=[train_new_user_input]
+                            outputs=[user_id]
                         )
                         
-                        # Define a function to get the user ID for training
-                        def get_train_user_id(dropdown_choice, new_user_id):
-                            if dropdown_choice == "new_user" and new_user_id and new_user_id.strip():
-                                return new_user_id.strip()
-                            elif dropdown_choice != "new_user":
-                                return dropdown_choice
-                            return "default"
-                        
-                        # Connect training button - using direct values instead of lambda function
+                        # Connect training button
                         train_btn.click(
                             fn=start_training,
                             inputs=[
@@ -1176,9 +1268,76 @@ def fastapi_app():
                                 train_image_urls,
                                 train_steps,
                                 train_prefix,
-                                train_postfix
+                                train_postfix,
+                                train_model_name
                             ],
                             outputs=train_output
+                        )
+
+            with gr.TabItem("Phantom Generation"):
+                with gr.Row():
+                    with gr.Column():
+                        phantom_ref_images = gr.Textbox(
+                            label="Reference Image URLs",
+                            placeholder="Enter image URLs (one per line)",
+                            lines=5
+                        )
+                        phantom_prompt = gr.Textbox(
+                            label="Prompt",
+                            placeholder="Enter your prompt in Chinese",
+                            lines=5
+                        )
+                        with gr.Row():
+                            phantom_width = gr.Number(
+                                label="Width",
+                                value=832,
+                                minimum=256,
+                                maximum=1280,
+                                step=32
+                            )
+                            phantom_height = gr.Number(
+                                label="Height",
+                                value=480,
+                                minimum=256,
+                                maximum=1280,
+                                step=32
+                            )
+                        phantom_seed = gr.Number(
+                            label="Seed",
+                            value=42
+                        )
+                        phantom_output = gr.Video(
+                            label="Generated Video"
+                        )
+                        phantom_btn = gr.Button("Generate Video", variant="primary")
+                        
+                        def run_phantom_generation(ref_image_urls, prompt, width, height, seed):
+                            if not ref_image_urls:
+                                return "Please provide reference image URLs"
+                            
+                            # Split URLs by newline and filter empty lines
+                            urls = [url.strip() for url in ref_image_urls.split("\n") if url.strip()]
+                            if not urls:
+                                return "Please provide valid reference image URLs"
+                            
+                            return phantom_generation.remote(
+                                ref_image_urls=urls,
+                                prompt=prompt,
+                                width=width,
+                                height=height,
+                                seed=seed
+                            )
+                        
+                        phantom_btn.click(
+                            fn=run_phantom_generation,
+                            inputs=[
+                                phantom_ref_images,
+                                phantom_prompt,
+                                phantom_width,
+                                phantom_height,
+                                phantom_seed
+                            ],
+                            outputs=phantom_output
                         )
 
         # Update user lists when interface loads
