@@ -9,6 +9,21 @@ import time
 import sys
 import glob
 
+# List of fake users
+FAKE_USERS = [
+    "default",
+    "user1",
+    "user2", 
+    "user3",
+    "user4",
+    "user5",
+    "user6",
+    "user7",
+    "user8",
+    "user9",
+    "user10"
+]
+
 # Building up the environment
 app = modal.App(name="flux-text-to-images")
 
@@ -688,6 +703,7 @@ web_image = image_dev.add_local_dir(
     image=web_image,
     max_containers=1,
     secrets=[s3_secret],
+    volumes={MODEL_DIR: volume},
 )
 @modal.concurrent(max_inputs=1000)
 @modal.asgi_app()
@@ -704,6 +720,7 @@ def fastapi_app():
     web_app = FastAPI()
 
     # Function to get available LoRA models for a user
+    @web_app.get("/api/lora_models")
     def get_available_lora_models(user_id):
         try:
             model_dir = os.path.join(MODEL_DIR, USER_MODELS_DIR, user_id)
@@ -716,17 +733,22 @@ def fastapi_app():
         except:
             return []
 
+    # User management routes
+    @web_app.get("/api/users", response_model=list)
+    def get_users():
+        # Return fake users list
+        return FAKE_USERS
+
     # Call out to the inference in a separate Modal environment with a GPU
-    def go(text="", user_id="default", use_finetuned=True, lora_model_name=None, use_all_models=False):
+    def go(text="", user_id="default", lora_model_name=None):
         if not text:
             text = example_prompts[0]
         
         # Create config with user settings
         user_config = AppConfig(
             user_id=user_id,
-            use_finetuned=use_finetuned,
-            lora_model_name=lora_model_name,
-            use_all_models=use_all_models
+            use_finetuned=True,  # Always use finetuned model
+            lora_model_name=lora_model_name
         )
         
         # Generate 4 images instead of 1
@@ -785,18 +807,6 @@ def fastapi_app():
         train.remote(urls, train_config)
         return f"Training started for user {user_id} with {len(urls)} images. This may take some time."
 
-    # User management routes
-    @web_app.get("/api/users", response_model=list)
-    async def get_users():
-        # List directories in USER_MODELS_DIR to get available users
-        try:
-            user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-            user_dirs = [d for d in os.listdir(user_models_path) 
-                        if os.path.isdir(os.path.join(user_models_path, d))]
-            return user_dirs
-        except FileNotFoundError:
-            return []
-
     # set up AppConfig
     config = AppConfig()
 
@@ -842,8 +852,7 @@ def fastapi_app():
     ) as interface:
         # Store user settings
         user_id = gr.State("default")
-        use_finetuned = gr.State(True)
-        use_all_models = gr.State(False)
+        selected_model = gr.State(None)
         
         gr.Markdown(
             f"# Generate images of {instance_phrase}.\n\n{description}",
@@ -856,96 +865,37 @@ def fastapi_app():
                         # User settings
                         user_dropdown = gr.Dropdown(
                             label="Select User",
-                            choices=["default", "new_user"],
-                            value="default"
-                        )
-                        new_user_input = gr.Textbox(
-                            label="New User ID",
-                            placeholder="Enter a unique ID for new user",
-                            visible=False
-                        )
-                        use_finetuned_checkbox = gr.Checkbox(
-                            label="Use Finetuned Model",
-                            value=True
-                        )
-                        use_all_models_checkbox = gr.Checkbox(
-                            label="Use All Finetune Models",
-                            value=False,
-                            visible=False
+                            choices=get_users(),
+                            value=get_users()[0]
                         )
                         lora_model_dropdown = gr.Dropdown(
                             label="Select LoRA Model",
-                            choices=get_available_lora_models(user_id),
+                            choices=[],
                             value=None,
-                            visible=False
+                            visible=True
                         )
                         
                         # Update user dropdown when page loads
                         def update_user_list():
-                            try:
-                                user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-                                users = ["default", "new_user"] + [d for d in os.listdir(user_models_path) 
-                                        if os.path.isdir(os.path.join(user_models_path, d)) and d != "default"]
-                                return gr.Dropdown(choices=list(set(users)))
-                            except FileNotFoundError:
-                                return gr.Dropdown(choices=["default", "new_user"])
-                        
-                        # Show/hide new user input based on dropdown selection
-                        def toggle_new_user_input(choice):
-                            if choice == "new_user":
-                                return gr.Textbox(visible=True), "default"
-                            else:
-                                return gr.Textbox(visible=False), choice
+                            return gr.Dropdown(choices=FAKE_USERS)
                         
                         # Update LoRA model dropdown when user changes
                         def update_lora_models(user_id):
-                            if user_id and user_id != "new_user":
-                                models = get_available_lora_models(user_id)
-                                return gr.Dropdown(choices=models, visible=len(models) > 0)
-                            return gr.Dropdown(choices=[], visible=False)
+                            print(f"Updating models for user: {user_id}")
+                            models = get_available_lora_models(user_id)
+                            print(f"Available models: {models}")
+                            
+                            if models:
+                                return gr.Dropdown(choices=models, value=models[0], visible=True)
+                            return gr.Dropdown(choices=[], value=None, visible=True)
                         
-                        # Update UI elements based on use_finetuned
-                        def toggle_finetune_options(use_finetuned):
-                            if use_finetuned:
-                                models = get_available_lora_models(user_id.value)
-                                return gr.Checkbox(visible=True), gr.Dropdown(choices=models, visible=len(models) > 0)
-                            return gr.Checkbox(visible=False), gr.Dropdown(visible=False)
-                        
-                        # Update LoRA model visibility based on use_all_models
-                        def toggle_lora_model_visibility(use_all_models):
-                            return gr.Dropdown(visible=not use_all_models)
-                        
+                        # Update selected model when LoRA dropdown changes
+                        def update_selected_model(model_name):
+                            return model_name
+                            
                         user_dropdown.change(
-                            toggle_new_user_input,
-                            inputs=[user_dropdown],
-                            outputs=[new_user_input, user_id]
-                        ).then(
-                            update_lora_models,
-                            inputs=[user_id],
-                            outputs=[lora_model_dropdown]
-                        )
-                        
-                        use_finetuned_checkbox.change(
-                            toggle_finetune_options,
-                            inputs=[use_finetuned_checkbox],
-                            outputs=[use_all_models_checkbox, lora_model_dropdown]
-                        )
-                        
-                        use_all_models_checkbox.change(
-                            toggle_lora_model_visibility,
-                            inputs=[use_all_models_checkbox],
-                            outputs=[lora_model_dropdown]
-                        )
-                        
-                        # Update user_id when new user is created
-                        def update_user_id(new_id):
-                            if new_id and new_id.strip():
-                                return new_id.strip()
-                            return "default"
-                        
-                        new_user_input.change(
-                            update_user_id,
-                            inputs=[new_user_input],
+                            lambda x: x,
+                            inputs=[user_dropdown], 
                             outputs=[user_id]
                         ).then(
                             update_lora_models,
@@ -953,20 +903,12 @@ def fastapi_app():
                             outputs=[lora_model_dropdown]
                         )
                         
-                        # Update use_finetuned state
-                        use_finetuned_checkbox.change(
-                            lambda x: x,
-                            inputs=[use_finetuned_checkbox],
-                            outputs=[use_finetuned]
+                        lora_model_dropdown.change(
+                            update_selected_model,
+                            inputs=[lora_model_dropdown],
+                            outputs=[selected_model]
                         )
-                        
-                        # Update use_all_models state
-                        use_all_models_checkbox.change(
-                            lambda x: x,
-                            inputs=[use_all_models_checkbox],
-                            outputs=[use_all_models]
-                        )
-                    
+
                     with gr.Column(scale=3):
                         inp = gr.Textbox(  # input text component
                             label="",
@@ -983,7 +925,7 @@ def fastapi_app():
                     btn = gr.Button("Dream", variant="primary", scale=2)
                     btn.click(
                         fn=go, 
-                        inputs=[inp, user_id, use_finetuned, lora_model_dropdown, use_all_models], 
+                        inputs=[inp, user_id, selected_model], 
                         outputs=out
                     )  # connect inputs and outputs with inference function
 
@@ -1092,13 +1034,8 @@ def fastapi_app():
                     with gr.Column():
                         train_user_dropdown = gr.Dropdown(
                             label="Select User",
-                            choices=["default", "new_user"],
-                            value="default"
-                        )
-                        train_new_user_input = gr.Textbox(
-                            label="New User ID",
-                            placeholder="Enter a unique ID for new user",
-                            visible=False
+                            choices=FAKE_USERS,
+                            value=FAKE_USERS[0]
                         )
                         train_instance_name = gr.Textbox(
                             label="Instance Name",
@@ -1120,6 +1057,11 @@ def fastapi_app():
                             placeholder="Text that comes after the instance name in training prompt",
                             value="in a mysterious foggy forest, glowing amulet around his neck, cinematic lighting"
                         )
+                        train_model_name = gr.Textbox(
+                            label="Model Name",
+                            placeholder="Enter a name for your model (e.g., my_character_v1)",
+                            value=""
+                        )
                         train_image_urls = gr.Textbox(
                             label="Image URLs",
                             placeholder="Enter image URLs (one per line) for training",
@@ -1137,36 +1079,15 @@ def fastapi_app():
                         
                         # Update user dropdown for training tab
                         def update_train_user_list():
-                            try:
-                                user_models_path = os.path.join(MODEL_DIR, USER_MODELS_DIR)
-                                users = ["default", "new_user"] + [d for d in os.listdir(user_models_path) 
-                                        if os.path.isdir(os.path.join(user_models_path, d)) and d != "default"]
-                                return gr.Dropdown(choices=list(set(users)))
-                            except FileNotFoundError:
-                                return gr.Dropdown(choices=["default", "new_user"])
-                        
-                        # Show/hide new user input based on dropdown selection for training
-                        def toggle_train_new_user_input(choice):
-                            if choice == "new_user":
-                                return gr.Textbox(visible=True)
-                            else:
-                                return gr.Textbox(visible=False)
+                            return gr.Dropdown(choices=FAKE_USERS)
                         
                         train_user_dropdown.change(
-                            toggle_train_new_user_input,
+                            lambda x: x,
                             inputs=[train_user_dropdown],
-                            outputs=[train_new_user_input]
+                            outputs=[user_id]
                         )
                         
-                        # Define a function to get the user ID for training
-                        def get_train_user_id(dropdown_choice, new_user_id):
-                            if dropdown_choice == "new_user" and new_user_id and new_user_id.strip():
-                                return new_user_id.strip()
-                            elif dropdown_choice != "new_user":
-                                return dropdown_choice
-                            return "default"
-                        
-                        # Connect training button - using direct values instead of lambda function
+                        # Connect training button
                         train_btn.click(
                             fn=start_training,
                             inputs=[
@@ -1176,7 +1097,8 @@ def fastapi_app():
                                 train_image_urls,
                                 train_steps,
                                 train_prefix,
-                                train_postfix
+                                train_postfix,
+                                train_model_name
                             ],
                             outputs=train_output
                         )
