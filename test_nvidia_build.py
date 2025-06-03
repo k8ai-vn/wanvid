@@ -26,22 +26,27 @@
 # print(response_body)
 
 
-
 import json
 import base64
-# with open("image.png", "wb") as f:
-#     f.write(base64.b64decode(response_body["artifacts"][0]["base64"]))
-    
+
 try:
     with open("response.json", "r") as f:
         response_body = json.load(f)
-        print(response_body["image"])
-        # save the base64 image to a file
-        with open("image.png", "wb") as f:
-            f.write(base64.b64decode(response_body["image"]))
+        
+        # Save all 6 images
+        for i in range(1,7):
+            image_key = f"image{i}"
+            if image_key in response_body:
+                print(f"Saving {image_key}")
+                # Save each base64 image to a separate file
+                with open(f"image{i}.png", "wb") as img_file:
+                    img_file.write(base64.b64decode(response_body[image_key]))
+            else:
+                print(f"Could not find {image_key} in response")
+
 except json.decoder.JSONDecodeError as e:
     print(f"Error decoding JSON: {e}")
 except FileNotFoundError:
     print("response.json file not found")
-except KeyError:
-    print("Could not find artifacts[0].base64 in JSON response")
+except KeyError as e:
+    print(f"Key error accessing JSON response: {e}")
