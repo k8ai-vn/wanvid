@@ -27,7 +27,8 @@ class ModelConfig:
     model_name: str = "black-forest-labs/FLUX.1-dev"
     # model_name: str = "black-forest-labs/FLUX.1-schnell"
     adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-    transformer_framepack = "lllyasviel/FramePack_F1_I2V_HY_20250503"
+    # Using FP8 quantized model for better VRAM efficiency (ComfyUI approach)
+    transformer_framepack = "kabachuha/FramePack_F1_I2V_HY_20250503_comfy"
     feature_extractor_framepack = "lllyasviel/flux_redux_bfl"
     image_encoder_framepack = "lllyasviel/flux_redux_bfl"
     model_hunyuan = "hunyuanvideo-community/HunyuanVideo"
@@ -238,7 +239,7 @@ class T2IRequest(BaseModel):
     num_images: int = 6
 class I2VRequest(BaseModel):
     prompt: str
-    image_url: str
+    image_base64: str
     width: int = 1024
     height: int = 1024
     num_images: int = 91
@@ -273,34 +274,39 @@ def download_model():
     #     local_dir=MODEL_ADAPTER_DIR,
     #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
     # )
-    # snapshot_download(
-    #     ModelConfig.transformer_framepack,
-    #     local_dir=MODEL_TRANSFORMER_FRAMEPACK_DIR,
-    #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
-    # )
+    # Download FP8 quantized model (ComfyUI approach)
+    # FP8 model: ~16.3GB vs original ~25.7GB (35% smaller)
+    # Uses all 24GB VRAM when combined with LoRA (fuse_lora=False)
+    from huggingface_hub import hf_hub_download
+    hf_hub_download(
+        repo_id=ModelConfig.transformer_framepack,
+        filename="FramePack_F1_I2V_HY_20250503_fp8_e4m3fn.safetensors",
+        local_dir=MODEL_TRANSFORMER_FRAMEPACK_DIR,
+        local_dir_use_symlinks=False
+    )
     
-    # snapshot_download(
-    #     ModelConfig.feature_extractor_framepack,
-    #     local_dir=MODEL_FEATURE_EXTRACTOR_FRAMEPACK_DIR,
-    #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
-    # )
-    
-    # snapshot_download(
-    #     ModelConfig.image_encoder_framepack,
-    #     local_dir=MODEL_IMAGE_ENCODER_FRAMEPACK_DIR,
-    #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
-    # )
-        
-    # snapshot_download(
-    #     ModelConfig.model_hunyuan,
-    #     local_dir=MODEL_HUNYUAN_COMMUNITY_DIR,
-    #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
-    # )
     snapshot_download(
-        ModelConfig.model_erax_ai,
-        local_dir=MODEL_ERAX_AI_DIR,
+        ModelConfig.feature_extractor_framepack,
+        local_dir=MODEL_FEATURE_EXTRACTOR_FRAMEPACK_DIR,
         ignore_patterns=["*.pt", "*.bin"],  # using safetensors
     )
+    
+    snapshot_download(
+        ModelConfig.image_encoder_framepack,
+        local_dir=MODEL_IMAGE_ENCODER_FRAMEPACK_DIR,
+        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    )
+        
+    snapshot_download(
+        ModelConfig.model_hunyuan,
+        local_dir=MODEL_HUNYUAN_COMMUNITY_DIR,
+        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    )
+    # snapshot_download(
+    #     ModelConfig.model_erax_ai,
+    #     local_dir=MODEL_ERAX_AI_DIR,
+    #     ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    # )
     
 def optimize(pipe, compile=True):
     # fuse QKV projections in Transformer and VAE
@@ -373,8 +379,9 @@ class Model:
     @modal.enter(snap=False)
     def setup(self):
         self.pipe.to("cuda")  # Move the model to a GPU!
+        # Load LoRA but don't fuse it (ComfyUI approach for VRAM efficiency)
         self.pipe.load_lora_weights(MODEL_ADAPTER_DIR)
-        self.pipe.fuse_lora()
+        # self.pipe.fuse_lora()  # Commented out to save VRAM like ComfyUI
         self.pipe = optimize(self.pipe, compile=self.compile)
 
         
@@ -430,7 +437,7 @@ class Model:
 )
 def i2v_inference( 
                     prompt: str,
-                    image_url: str, 
+                    image_base64: str, 
                     width: int = 1024, 
                     height: int = 1024, 
                     num_inference_steps: int = 25,
@@ -443,15 +450,42 @@ def i2v_inference(
     import io
     import base64
     import numpy as np
+    from PIL import Image
     from diffusers.utils import load_image
     from diffusers_helper.utils import resize_and_center_crop
     from diffusers_helper.bucket_tools import find_nearest_bucket
     from diffusers_helper.thread_utils import AsyncStream
     from FramePack_F1_ok.app import worker as worker_framepack
 
-    # Load and process input image
-    input_image = load_image(image_url)
-    input_image_np = np.array(input_image)
+    # Load and process input image from base64
+    # Decode base64 image
+    try:
+        # Handle data URL format if present
+        if image_base64.startswith('data:image'):
+            # Remove data URL prefix
+            image_base64 = image_base64.split(',')[1]
+        
+        # Add padding if necessary
+        missing_padding = len(image_base64) % 4
+        if missing_padding:
+            image_base64 += '=' * (4 - missing_padding)
+        
+        image_data = base64.b64decode(image_base64)
+        input_image = Image.open(io.BytesIO(image_data))
+        
+        # Convert RGBA to RGB if necessary
+        if input_image.mode == 'RGBA':
+            # Create a white background
+            background = Image.new('RGB', input_image.size, (255, 255, 255))
+            background.paste(input_image, mask=input_image.split()[-1])  # Use alpha channel as mask
+            input_image = background
+        elif input_image.mode != 'RGB':
+            input_image = input_image.convert('RGB')
+            
+        input_image_np = np.array(input_image)
+        
+    except Exception as e:
+        raise ValueError(f"Invalid base64 image data: {str(e)}")
     
     # Find nearest bucket size for the image
     H, W, C = input_image_np.shape
@@ -611,7 +645,7 @@ def process_job_inference(prompt: str, width: int = 1024, height: int = 1024, nu
     return Model().t2i_inference.remote(prompt, width, height, num_images)
 
 @app.function(timeout=3600)
-def process_job_inference_framepack(prompt: str, image_url: str, 
+def process_job_inference_framepack(prompt: str, image_base64: str, 
                                     width: int = 1024, height: int = 1024, 
                                     num_images: int = 91, num_inference_steps: int = 25,
                                     guidance_scale: float = 10.0,
@@ -621,7 +655,7 @@ def process_job_inference_framepack(prompt: str, image_url: str,
                                     gpu_memory_preservation: float = 6.0,
                                     mp4_crf: int = 16):
     return i2v_inference.remote(prompt, 
-                                image_url, 
+                                image_base64, 
                                 width, 
                                 height, 
                                 num_inference_steps, 
@@ -669,7 +703,7 @@ async def t2i_job_endpoint(request: T2IRequest):
 async def i2v_job_endpoint(request: I2VRequest):
     process_job = modal.Function.from_name("ai-gen-flux", "process_job_inference_framepack")
     call = process_job.spawn(request.prompt, 
-                             request.image_url, 
+                             request.image_base64, 
                              request.width, 
                              request.height, 
                              request.num_images, 
